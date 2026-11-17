@@ -1,0 +1,43 @@
+name: TokenAPI new-api image validation
+
+on:
+  pull_request:
+    branches: [tokenapi/main]
+  push:
+    branches: [tokenapi/main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tokenapi-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build original new-api image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Verify upstream baseline and protected attributions
+        shell: bash
+        run: |
+          upstream_tag=$(cat UPSTREAM_VERSION)
+          git merge-base --is-ancestor "$upstream_tag" HEAD
+          git diff --exit-code "$upstream_tag" -- 'README*' LICENSE NOTICE THIRD-PARTY-LICENSES.md
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build upstream Dockerfile without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: new-api-tokenapi:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify license artifacts in the built image
+        run: docker run --rm --entrypoint sh new-api-tokenapi:ci -c 'test -s /licenses/LICENSE && test -s /licenses/NOTICE && test -s /licenses/THIRD-PARTY-LICENSES.md'
