@@ -1,0 +1,66 @@
+name: TokenAPI CP-02 database contracts
+
+on:
+  pull_request:
+    branches: [tokenapi/main]
+  push:
+    branches: [tokenapi/main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tokenapi-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sqlite
+            dsn: local
+          - engine: mysql
+            dsn: root:disposable-test-password@tcp(127.0.0.1:3306)/gateway_test?charset=utf8mb4&parseTime=true
+          - engine: postgres
+            dsn: postgres://postgres:disposable-test-password@127.0.0.1:5432/gateway_test?sslmode=disable
+    services:
+      mysql:
+        image: ${{ matrix.engine == 'mysql' && 'mysql:8.4' || '' }}
+        env:
+          MYSQL_ROOT_PASSWORD: disposable-test-password
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_DATABASE: gateway_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      postgres:
+        image: ${{ matrix.engine == 'postgres' && 'postgres:16-alpine' || '' }}
+        env:
+          POSTGRES_PASSWORD: disposable-test-password
+          POSTGRES_DB: gateway_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U postgres -d gateway_test"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    env:
+      GOWORK: 'off'
+      TOKENAPI_TEST_SQL_DSN: ${{ matrix.dsn }}
+      TOKENAPI_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+      - name: Verify real database, cache, auth and quota contracts
+        run: go test -race ./router -run '^TestTokenAPI' -count=1 -v
