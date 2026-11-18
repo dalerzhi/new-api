@@ -59,6 +59,10 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	}
 	ttl := userCacheTTLSeconds()
 	user.CacheExpiresAt = time.Now().Add(time.Duration(ttl) * time.Second).UnixMilli()
+	quotaRevision, tokenAPIEnabled, err := tokenAPIQuotaCacheSnapshot(user, includeQuota)
+	if err != nil {
+		return err
+	}
 	mac, err := user.cacheMAC()
 	if err != nil {
 		return err
@@ -80,21 +84,28 @@ end
 if ARGV[10] == '0' and redis.call('EXISTS', KEYS[1]) == 0 then
   return 1
 end
+local fillQuota = ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$')
+if fillQuota and ARGV[16] == '1' and tonumber(ARGV[15]) < tonumber(redis.call('GET', KEYS[4]) or '0') then
+  return 0
+end
 redis.call('HSET', KEYS[1],
   'Id', ARGV[2], 'Group', ARGV[3], 'Email', ARGV[4],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
   'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9],
   'CacheExpiresAt', ARGV[13], 'CacheMAC', ARGV[14])
-if ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$') then
+if fillQuota then
+  if ARGV[16] == '1' then
+    redis.call('HSET', KEYS[1], 'TokenAPIQuotaRevision', ARGV[15])
+  end
   redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[12])
 return 1`
 	result, err := common.RDB.Eval(context.Background(), script,
-		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},
+		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), tokenAPIQuotaVersionKey(user.Id)},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
 		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
-		user.CacheExpiresAt, mac,
+		user.CacheExpiresAt, mac, quotaRevision, tokenAPIEnabled,
 	).Int()
 	if err != nil {
 		return err
