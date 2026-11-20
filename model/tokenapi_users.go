@@ -57,7 +57,7 @@ func ValidTokenAPIAccountID(id string) bool {
 func CreateTokenAPIManagedUser(ctx context.Context, input TokenAPIManagedUserInput) (*TokenAPIManagedSnapshot, error) {
 	if !ValidTokenAPIAccountID(input.AccountID) || !tokenAPIUsername.MatchString(input.Username) ||
 		strings.TrimSpace(input.DisplayName) == "" || len(input.DisplayName) > 20 ||
-		input.Group == "auto" || !ratio_setting.ContainsGroupRatio(input.Group) {
+		input.Group == "" || input.Group == "auto" {
 		return nil, ErrTokenAPIInvalid
 	}
 	encoded, err := common.Marshal(input)
@@ -76,6 +76,9 @@ func CreateTokenAPIManagedUser(ctx context.Context, input TokenAPIManagedUserInp
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
+	}
+	if !ratio_setting.ContainsGroupRatio(input.Group) {
+		return nil, ErrTokenAPIInvalid
 	}
 	if common.QuotaForNewUser != 0 {
 		return nil, ErrTokenAPICache
