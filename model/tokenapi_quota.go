@@ -38,7 +38,7 @@ type TokenAPIQuotaSnapshot struct {
 }
 
 func MigrateTokenAPI() error {
-	return DB.AutoMigrate(&TokenAPIQuotaGrant{})
+	return DB.AutoMigrate(&TokenAPIQuotaGrant{}, &TokenAPIManagedUser{})
 }
 
 // syncTokenAPIGrant is retryable across process exits and ambiguous Redis

@@ -731,7 +731,7 @@ func RevokeAllUserSessions(userID int, reason string) (int64, error) {
 	return revokeUserSessions(userID, "", reason)
 }
 
-func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
+func revokeUserSessions(userID int, excludedSID, reason string, beforeAuthVersion ...int64) (int64, error) {
 	if userID <= 0 {
 		return 0, ErrUserSessionInvalid
 	}
@@ -739,6 +739,9 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 	var totalAffected int64
 	for {
 		query := DB.Where("user_id = ? AND status = ? AND expires_at > ?", userID, UserSessionStatusActive, now)
+		if len(beforeAuthVersion) > 0 {
+			query = query.Where("user_auth_version < ?", beforeAuthVersion[0])
+		}
 		if excludedSID != "" {
 			query = query.Where("sid <> ?", excludedSID)
 		}
@@ -749,9 +752,11 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 		if len(candidates) == 0 {
 			return totalAffected, nil
 		}
-		for i := range candidates {
-			if err := writeUserSessionDenyFence(&candidates[i], UserSessionStatusRevoking, now, reason); err != nil {
-				return totalAffected, err
+		if len(beforeAuthVersion) == 0 {
+			for i := range candidates {
+				if err := writeUserSessionDenyFence(&candidates[i], UserSessionStatusRevoking, now, reason); err != nil {
+					return totalAffected, err
+				}
 			}
 		}
 
@@ -762,7 +767,11 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 		var affected int64
 		var revoked []UserSession
 		err := DB.Transaction(func(tx *gorm.DB) error {
-			if err := lockForUpdate(tx).Where("sid IN ? AND status = ?", sids, UserSessionStatusActive).Find(&revoked).Error; err != nil {
+			query := lockForUpdate(tx).Where("sid IN ? AND status = ?", sids, UserSessionStatusActive)
+			if len(beforeAuthVersion) > 0 {
+				query = query.Where("user_auth_version < ?", beforeAuthVersion[0])
+			}
+			if err := query.Find(&revoked).Error; err != nil {
 				return err
 			}
 			if len(revoked) == 0 {
@@ -770,6 +779,13 @@ func revokeUserSessions(userID int, excludedSID, reason string) (int64, error) {
 			}
 			lockedSIDs := make([]string, 0, len(revoked))
 			for i := range revoked {
+				// A managed-user repair must recheck the auth bound under the
+				// session lock before fencing a possibly advanced session.
+				if len(beforeAuthVersion) > 0 {
+					if err := writeUserSessionDenyFence(&revoked[i], UserSessionStatusRevoking, now, reason); err != nil {
+						return err
+					}
+				}
 				lockedSIDs = append(lockedSIDs, revoked[i].SID)
 			}
 			result := tx.Model(&UserSession{}).Where("sid IN ? AND status = ?", lockedSIDs, UserSessionStatusActive).Updates(map[string]any{

@@ -27,10 +27,13 @@ func SetTokenAPIRouter(router *gin.Engine) {
 		if err := model.MigrateTokenAPI(); err != nil {
 			panic("TokenAPI internal migration failed")
 		}
-	} else if !model.DB.Migrator().HasTable(&model.TokenAPIQuotaGrant{}) {
+	} else if !model.DB.Migrator().HasTable(&model.TokenAPIQuotaGrant{}) || !model.DB.Migrator().HasTable(&model.TokenAPIManagedUser{}) {
 		panic("TokenAPI internal migration must run on the master first")
 	}
 	group := router.Group("/internal/tokenapi/v1", middleware.TokenAPIInternalAuth(secret))
+	group.POST("/managed-users", controller.TokenAPIManagedUsers)
+	group.GET("/managed-users/:account_id", controller.TokenAPIManagedUsers)
+	group.POST("/managed-users/:account_id/lifecycle", controller.TokenAPIManagedUserLifecycle)
 	group.POST("/users/:uid/tokens", controller.TokenAPITokens)
 	group.GET("/users/:uid/tokens", controller.TokenAPITokens)
 	group.PATCH("/users/:uid/tokens/:tid", controller.TokenAPIToken)

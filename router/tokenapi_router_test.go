@@ -32,6 +32,264 @@ import (
 
 const internalTestSecret = "internal-test-secret-with-at-least-32-bytes"
 
+func TestTokenAPIManagedUserLifecycleRetainsSpendAndRejectsStaleCommands(t *testing.T) {
+	engine := tokenAPITestEngine(t)
+	oldGift := common.QuotaForNewUser
+	oldBatch := common.BatchUpdateEnabled
+	common.QuotaForNewUser = 0
+	common.BatchUpdateEnabled = false
+	t.Cleanup(func() { common.QuotaForNewUser = oldGift; common.BatchUpdateEnabled = oldBatch })
+	originalGroups := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"trial":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroups)) })
+	accountID := uuid.NewString()
+	create := map[string]any{"account_id": accountID, "username": "u_" + strings.ReplaceAll(accountID, "-", "")[:18], "display_name": "Managed fixture", "group": "default"}
+	created := internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", create)
+	require.Equal(t, http.StatusOK, created.Code, created.Body.String())
+	snapshot := managedResult(t, created)
+	userID := snapshot.UserID
+	require.Positive(t, userID)
+	assert.Equal(t, accountID, snapshot.AccountID)
+	assert.Zero(t, snapshot.Revision)
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Equal(t, common.RoleCommonUser, user.Role)
+	assert.Zero(t, user.Quota)
+	assert.NotContains(t, created.Body.String(), "password")
+	repeated := internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", create)
+	require.Equal(t, http.StatusOK, repeated.Code, repeated.Body.String())
+	assert.JSONEq(t, created.Body.String(), repeated.Body.String())
+	before := quotaResult(t, grantInternal(engine, userID, 1000000, 0))
+	assert.Equal(t, 1000000, before.Quota)
+	reserved, err := model.TryReserveUserQuota(userID, 50000)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	path := "/internal/tokenapi/v1/managed-users/" + accountID + "/lifecycle"
+	disable := map[string]any{"user_id": userID, "action": "disable", "expected_revision": 0}
+	changed := internalCall(engine, http.MethodPost, path, disable)
+	require.Equal(t, http.StatusOK, changed.Code, changed.Body.String())
+	assert.Equal(t, http.StatusConflict, internalCall(engine, http.MethodPost, path, disable).Code)
+	cached, err := model.GetUserCache(userID)
+	require.NoError(t, err)
+	assert.Equal(t, common.UserStatusDisabled, cached.Status)
+	assert.Equal(t, 950000, quotaResult(t, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/quota/batch-get", map[string]any{"user_ids": []int{userID}})).Quota)
+	enabled := internalCall(engine, http.MethodPost, path, map[string]any{"user_id": userID, "action": "enable", "expected_revision": 1})
+	require.Equal(t, http.StatusOK, enabled.Code, enabled.Body.String())
+	assert.Equal(t, http.StatusConflict, internalCall(engine, http.MethodPost, path, disable).Code)
+	deleted := internalCall(engine, http.MethodPost, path, map[string]any{"user_id": userID, "action": "delete", "expected_revision": 2})
+	require.Equal(t, http.StatusOK, deleted.Code, deleted.Body.String())
+	require.NoError(t, model.DB.Unscoped().First(&user, userID).Error)
+	assert.True(t, user.DeletedAt.Valid)
+	assert.Equal(t, 950000, user.Quota)
+	assert.Equal(t, http.StatusConflict, internalCall(engine, http.MethodPost, path, map[string]any{"user_id": userID, "action": "enable", "expected_revision": 3}).Code)
+	var audits []model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("auth_method = ?", "hmac").Find(&audits).Error)
+	require.NotEmpty(t, audits)
+	var actions []string
+	for _, audit := range audits {
+		if audit.Success {
+			actions = append(actions, audit.Action)
+		}
+		assert.Zero(t, audit.ActorRole, "machine audit must not impersonate a gateway administrator")
+		assert.Empty(t, audit.UserAgent)
+		assert.Empty(t, audit.TokenRef)
+	}
+	assert.Contains(t, actions, "tokenapi.managed_user.create")
+	assert.Contains(t, actions, "tokenapi.managed_user.disable")
+	assert.Contains(t, actions, "tokenapi.managed_user.enable")
+	assert.Contains(t, actions, "tokenapi.managed_user.delete")
+}
+
+type managedSnapshot struct {
+	AccountID string `json:"account_id"`
+	UserID    int    `json:"user_id"`
+	Revision  int64  `json:"revision"`
+	Status    int    `json:"status"`
+	Deleted   bool   `json:"deleted"`
+}
+
+func managedResult(t *testing.T, recorder *httptest.ResponseRecorder) managedSnapshot {
+	t.Helper()
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	var response struct {
+		Data managedSnapshot `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Positive(t, response.Data.UserID)
+	return response.Data
+}
+
+func TestTokenAPIManagedUsersRejectAdoptionRolesAndExtraFields(t *testing.T) {
+	engine := tokenAPITestEngine(t)
+	oldGift := common.QuotaForNewUser
+	common.QuotaForNewUser = 0
+	t.Cleanup(func() { common.QuotaForNewUser = oldGift })
+	originalGroups := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroups)) })
+	accountID := uuid.NewString()
+	base := map[string]any{"account_id": accountID, "username": "u_" + strings.ReplaceAll(accountID, "-", "")[:18], "display_name": "Managed fixture", "group": "default"}
+	for _, field := range []string{"role", "quota", "user_id", "password"} {
+		t.Run("reject extra "+field, func(t *testing.T) {
+			input := make(map[string]any)
+			for key, value := range base {
+				input[key] = value
+			}
+			input[field] = 100
+			assert.Equal(t, http.StatusBadRequest, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", input).Code)
+		})
+	}
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		legacy := internalTestUser(t, "unmanaged")
+		legacy.Username = "u_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:18]
+		require.NoError(t, model.DB.Model(&legacy).Updates(map[string]any{"role": role, "username": legacy.Username}).Error)
+		input := map[string]any{"account_id": uuid.NewString(), "username": legacy.Username, "display_name": "Existing fixture", "group": "default"}
+		assert.Equal(t, http.StatusConflict, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", input).Code)
+		require.NoError(t, model.DB.First(&legacy, legacy.Id).Error)
+		assert.Equal(t, role, legacy.Role)
+		assert.Equal(t, common.UserStatusEnabled, legacy.Status)
+	}
+	managed := managedResult(t, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", base))
+	_, err := model.GetUserCache(managed.UserID)
+	require.NoError(t, err)
+	path := "/internal/tokenapi/v1/managed-users/" + accountID + "/lifecycle"
+	assert.Equal(t, http.StatusNotFound, internalCall(engine, http.MethodGet, "/internal/tokenapi/v1/managed-users/"+uuid.NewString(), nil).Code)
+	for _, input := range []map[string]any{
+		{"user_id": managed.UserID, "action": "disable", "expected_revision": 0, "quota": 1},
+		{"user_id": managed.UserID, "action": "promote", "expected_revision": 0},
+		{"user_id": managed.UserID, "action": "disable"},
+		{"user_id": managed.UserID, "action": "disable", "expected_revision": -1},
+	} {
+		assert.Equal(t, http.StatusBadRequest, internalCall(engine, http.MethodPost, path, input).Code)
+	}
+	for _, role := range []int{common.RoleAdminUser, common.RoleRootUser} {
+		// The stale ordinary cache must not authorize a database administrator.
+		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", managed.UserID).UpdateColumn("role", role).Error)
+		assert.Equal(t, http.StatusForbidden, internalCall(engine, http.MethodPost, path, map[string]any{"user_id": managed.UserID, "action": "disable", "expected_revision": 0}).Code)
+		assert.Equal(t, http.StatusForbidden, internalCall(engine, http.MethodGet, "/internal/tokenapi/v1/managed-users/"+accountID, nil).Code)
+		var current model.User
+		require.NoError(t, model.DB.First(&current, managed.UserID).Error)
+		assert.Equal(t, role, current.Role)
+		assert.Equal(t, common.UserStatusEnabled, current.Status)
+	}
+	common.QuotaForNewUser = 500000
+	otherID := uuid.NewString()
+	var before, after int64
+	require.NoError(t, model.DB.Model(&model.User{}).Count(&before).Error)
+	assert.Equal(t, http.StatusServiceUnavailable, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", map[string]any{"account_id": otherID, "username": "u_" + strings.ReplaceAll(otherID, "-", "")[:18], "display_name": "No gift", "group": "default"}).Code)
+	require.NoError(t, model.DB.Model(&model.User{}).Count(&after).Error)
+	assert.Equal(t, before, after)
+}
+
+func TestTokenAPIManagedUsersConcurrentCreationAndLifecycle(t *testing.T) {
+	engine := tokenAPITestEngine(t)
+	oldGift := common.QuotaForNewUser
+	common.QuotaForNewUser = 0
+	t.Cleanup(func() { common.QuotaForNewUser = oldGift })
+	id := uuid.NewString()
+	create := map[string]any{"account_id": id, "username": "u_" + strings.ReplaceAll(id, "-", "")[:18], "display_name": "Concurrent", "group": "default"}
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Go(func() {
+			<-start
+			responses <- internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", create)
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(responses)
+	for response := range responses {
+		assert.Contains(t, []int{http.StatusOK, http.StatusServiceUnavailable}, response.Code, response.Body.String())
+	}
+	managed := managedResult(t, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", create))
+	var count int64
+	require.NoError(t, model.DB.Model(&model.User{}).Where("username = ?", create["username"]).Count(&count).Error)
+	assert.EqualValues(t, 1, count, "competing creation must not leave orphan users")
+	altered := map[string]any{"account_id": id, "username": create["username"], "display_name": "Different", "group": "default"}
+	assert.Equal(t, http.StatusConflict, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", altered).Code)
+	path := "/internal/tokenapi/v1/managed-users/" + id + "/lifecycle"
+	assert.Equal(t, http.StatusForbidden, internalCall(engine, http.MethodPost, path, map[string]any{"user_id": managed.UserID + 1, "action": "disable", "expected_revision": 0}).Code)
+	responses = make(chan *httptest.ResponseRecorder, 2)
+	start = make(chan struct{})
+	for _, action := range []string{"enable", "disable"} {
+		workers.Go(func() {
+			<-start
+			responses <- internalCall(engine, http.MethodPost, path, map[string]any{"user_id": managed.UserID, "action": action, "expected_revision": 0})
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(responses)
+	accepted := 0
+	for response := range responses {
+		assert.Contains(t, []int{http.StatusOK, http.StatusConflict, http.StatusServiceUnavailable}, response.Code, response.Body.String())
+		if response.Code == http.StatusOK {
+			accepted++
+		}
+	}
+	assert.Equal(t, 1, accepted, "one expected revision may authorize only one command")
+	current := managedResult(t, internalCall(engine, http.MethodGet, "/internal/tokenapi/v1/managed-users/"+id, nil))
+	assert.EqualValues(t, 1, current.Revision)
+	assert.Equal(t, http.StatusConflict, internalCall(engine, http.MethodPost, path, map[string]any{"user_id": managed.UserID, "action": "disable", "expected_revision": 0}).Code)
+}
+
+func TestTokenAPIManagedUsersLateCleanupPreservesNewSession(t *testing.T) {
+	engine := tokenAPITestEngine(t)
+	oldGift := common.QuotaForNewUser
+	common.QuotaForNewUser = 0
+	t.Cleanup(func() { common.QuotaForNewUser = oldGift })
+	id := uuid.NewString()
+	managed := managedResult(t, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", map[string]any{"account_id": id, "username": "u_" + strings.ReplaceAll(id, "-", "")[:18], "display_name": "Sessions", "group": "default"}))
+	oldSession := model.UserSession{SID: uuid.NewString(), UserID: managed.UserID, UserAuthVersion: 1, RefreshHash: strings.Repeat("a", 64), ExpiresAt: time.Now().Unix() + 3600}
+	require.NoError(t, model.CreateUserSession(&oldSession))
+	paused, resume := make(chan struct{}), make(chan struct{})
+	var armed atomic.Bool
+	armed.Store(true)
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register("test_tokenapi_pause_session_cleanup", func(tx *gorm.DB) {
+		if tx.Statement.Table == "user_sessions" && armed.CompareAndSwap(true, false) {
+			close(paused)
+			<-resume
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove("test_tokenapi_pause_session_cleanup")) })
+	path := "/internal/tokenapi/v1/managed-users/" + id + "/lifecycle"
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- internalCall(engine, http.MethodPost, path, map[string]any{"user_id": managed.UserID, "action": "disable", "expected_revision": 0})
+	}()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("disable did not reach post-commit session cleanup")
+	}
+	// The first operation committed; a newer enable and login finish while its
+	// cleanup is still delayed. Releasing it must not revoke this new session.
+	enabled := internalCall(engine, http.MethodPost, path, map[string]any{"user_id": managed.UserID, "action": "enable", "expected_revision": 1})
+	var current model.User
+	err := model.DB.First(&current, managed.UserID).Error
+	newSession := model.UserSession{SID: uuid.NewString(), UserID: managed.UserID, UserAuthVersion: current.AuthVersion, RefreshHash: strings.Repeat("b", 64), ExpiresAt: time.Now().Unix() + 3600}
+	createErr := model.CreateUserSession(&newSession)
+	close(resume)
+	first := <-done
+	require.Equal(t, http.StatusOK, enabled.Code, enabled.Body.String())
+	require.NoError(t, err)
+	require.NoError(t, createErr)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	old, err := model.GetUserSessionBySID(oldSession.SID)
+	require.NoError(t, err)
+	assert.Equal(t, model.UserSessionStatusRevoked, old.Status)
+	fresh, err := model.GetUserSessionBySID(newSession.SID)
+	require.NoError(t, err)
+	assert.Equal(t, model.UserSessionStatusActive, fresh.Status)
+	assert.EqualValues(t, 3, fresh.UserAuthVersion)
+	view := managedResult(t, internalCall(engine, http.MethodGet, "/internal/tokenapi/v1/managed-users/"+id, nil))
+	assert.EqualValues(t, 2, view.Revision)
+	assert.Equal(t, common.UserStatusEnabled, view.Status)
+}
+
 func tokenAPITestEngine(t *testing.T, beforeMigration ...func()) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -100,6 +358,11 @@ func TestTokenAPIDisabledWithoutSecret(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/internal/tokenapi/v1/quota/batch-get", nil))
 	assert.Equal(t, http.StatusNotFound, recorder.Code)
+	for _, path := range []string{"/internal/tokenapi/v1/managed-users", "/internal/tokenapi/v1/managed-users/" + uuid.NewString() + "/lifecycle"} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
+		assert.Equal(t, http.StatusNotFound, recorder.Code)
+	}
 }
 
 func TestTokenAPIAuthenticationRejectsTamperingExpiryAndReplay(t *testing.T) {
@@ -143,10 +406,11 @@ type internalRedisFault struct {
 	after bool
 	fired bool
 	evict bool
+	auth  bool
 }
 
 func (fault *internalRedisFault) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-	if !fault.after && !fault.fired && cmd.Name() == "eval" && strings.Contains(fmt.Sprint(cmd.Args()[1]), "HINCRBY") && strings.Contains(fmt.Sprint(cmd.Args()[1]), "TokenAPIQuotaRevision") {
+	if !fault.after && !fault.fired && cmd.Name() == "eval" && ((fault.auth && strings.Contains(fmt.Sprint(cmd.Args()[1]), "CacheMAC")) || (!fault.auth && strings.Contains(fmt.Sprint(cmd.Args()[1]), "HINCRBY") && strings.Contains(fmt.Sprint(cmd.Args()[1]), "TokenAPIQuotaRevision"))) {
 		fault.fired = true
 		if fault.evict {
 			return ctx, common.RDB.Del(ctx, fmt.Sprint(cmd.Args()[3])).Err()
@@ -156,7 +420,7 @@ func (fault *internalRedisFault) BeforeProcess(ctx context.Context, cmd redis.Cm
 	return ctx, nil
 }
 func (fault *internalRedisFault) AfterProcess(_ context.Context, cmd redis.Cmder) error {
-	if fault.after && !fault.fired && cmd.Name() == "eval" && strings.Contains(fmt.Sprint(cmd.Args()[1]), "HINCRBY") && strings.Contains(fmt.Sprint(cmd.Args()[1]), "TokenAPIQuotaRevision") {
+	if fault.after && !fault.fired && cmd.Name() == "eval" && ((fault.auth && strings.Contains(fmt.Sprint(cmd.Args()[1]), "CacheMAC")) || (!fault.auth && strings.Contains(fmt.Sprint(cmd.Args()[1]), "HINCRBY") && strings.Contains(fmt.Sprint(cmd.Args()[1]), "TokenAPIQuotaRevision"))) {
 		fault.fired = true
 		return errors.New("injected lost Redis reply")
 	}
@@ -166,6 +430,42 @@ func (*internalRedisFault) BeforeProcessPipeline(ctx context.Context, _ []redis.
 	return ctx, nil
 }
 func (*internalRedisFault) AfterProcessPipeline(context.Context, []redis.Cmder) error { return nil }
+
+func TestTokenAPIManagedUsersRecoverCommittedCacheFailures(t *testing.T) {
+	for _, lostReply := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lost reply %t", lostReply), func(t *testing.T) {
+			engine := tokenAPITestEngine(t)
+			oldGift := common.QuotaForNewUser
+			common.QuotaForNewUser = 0
+			t.Cleanup(func() { common.QuotaForNewUser = oldGift })
+			id := uuid.NewString()
+			managed := managedResult(t, internalCall(engine, http.MethodPost, "/internal/tokenapi/v1/managed-users", map[string]any{"account_id": id, "username": "u_" + strings.ReplaceAll(id, "-", "")[:18], "display_name": "Recovery", "group": "default"}))
+			_, err := model.GetUserCache(managed.UserID)
+			require.NoError(t, err)
+			fault := &internalRedisFault{auth: true, after: lostReply}
+			common.RDB.AddHook(fault)
+			path := "/internal/tokenapi/v1/managed-users/" + id + "/lifecycle"
+			command := map[string]any{"user_id": managed.UserID, "action": "disable", "expected_revision": 0}
+			first := internalCall(engine, http.MethodPost, path, command)
+			require.True(t, fault.fired)
+			assert.Equal(t, http.StatusServiceUnavailable, first.Code)
+			var binding model.TokenAPIManagedUser
+			require.NoError(t, model.DB.First(&binding, "account_id = ?", id).Error)
+			assert.EqualValues(t, 1, binding.Revision)
+			assert.EqualValues(t, 2, binding.PendingAuthVersion)
+			// The old command must not execute again, even after an ambiguous reply.
+			assert.Equal(t, http.StatusConflict, internalCall(engine, http.MethodPost, path, command).Code)
+			view := managedResult(t, internalCall(engine, http.MethodGet, "/internal/tokenapi/v1/managed-users/"+id, nil))
+			assert.EqualValues(t, 1, view.Revision)
+			assert.Equal(t, common.UserStatusDisabled, view.Status)
+			cached, err := model.GetUserCache(managed.UserID)
+			require.NoError(t, err)
+			assert.Equal(t, common.UserStatusDisabled, cached.Status)
+			require.NoError(t, model.DB.First(&binding, "account_id = ?", id).Error)
+			assert.Zero(t, binding.PendingAuthVersion)
+		})
+	}
+}
 
 func TestTokenAPIQuotaRecoversAmbiguousCacheSynchronization(t *testing.T) {
 	for _, mode := range []string{"before cache apply", "lost cache reply", "evicted cache"} {
@@ -343,6 +643,7 @@ func TestTokenAPIMigrationPreservesReleasedSchemaAndData(t *testing.T) {
 		// before the new router hook migrates CP-02, as on an upgraded instance.
 		// Only the disposable test database is used; restore the pre-patch schema.
 		require.NoError(t, model.DB.Migrator().DropTable(&model.TokenAPIQuotaGrant{}))
+		require.NoError(t, model.DB.Migrator().DropTable(&model.TokenAPIManagedUser{}))
 		require.False(t, model.DB.Migrator().HasTable(&model.TokenAPIQuotaGrant{}))
 		original = internalTestUser(t, "upgrade")
 		require.NoError(t, model.DB.Model(&original).Update("quota", 123456).Error)
@@ -369,6 +670,11 @@ func TestTokenAPIMigrationPreservesReleasedSchemaAndData(t *testing.T) {
 	grant := model.TokenAPIQuotaGrant{UserID: original.Id}
 	require.NoError(t, model.DB.Create(&grant).Error)
 	assert.Error(t, model.DB.Create(&model.TokenAPIQuotaGrant{UserID: original.Id}).Error, "grant primary key must remain unique")
+	assert.True(t, model.DB.Migrator().HasTable(&model.TokenAPIManagedUser{}))
+	binding := model.TokenAPIManagedUser{AccountID: uuid.NewString(), UserID: original.Id, CreationHash: strings.Repeat("a", 64)}
+	require.NoError(t, model.DB.Create(&binding).Error)
+	assert.Error(t, model.DB.Create(&model.TokenAPIManagedUser{AccountID: uuid.NewString(), UserID: original.Id, CreationHash: binding.CreationHash}).Error, "a gateway user cannot have multiple owners")
+	assert.Error(t, model.DB.Create(&model.TokenAPIManagedUser{AccountID: binding.AccountID, UserID: original.Id + 1, CreationHash: binding.CreationHash}).Error, "an account cannot have multiple bindings")
 	var version string
 	query := "SELECT version()"
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
