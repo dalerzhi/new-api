@@ -34,6 +34,10 @@ func tokenAPIError(c *gin.Context, err error) {
 		status, message = http.StatusBadRequest, "Invalid internal request"
 	} else if errors.Is(err, gorm.ErrRecordNotFound) {
 		status, message = http.StatusNotFound, "Internal resource not found"
+	} else if errors.Is(err, model.ErrTokenAPIConflict) {
+		status, message = http.StatusConflict, "Internal resource conflict"
+	} else if errors.Is(err, model.ErrTokenAPIForbidden) {
+		status, message = http.StatusForbidden, "Internal resource outside managed scope"
 	}
 	c.AbortWithStatusJSON(status, gin.H{"success": false, "message": message})
 }

@@ -24,6 +24,16 @@ leaves routes, schema and quota-cache behavior unchanged.
 - Internal token CRUD scopes every operation to the supplied user. Only token
   creation returns a usable key; list/update responses are masked. PATCH writes
   only supplied columns and reuses the upstream cache invalidation mechanism.
+- Managed-customer creation atomically inserts an ordinary zero-quota user and
+  an immutable platform-account binding. Existing users cannot be adopted;
+  conflicting creation parameters are rejected. The generated random password
+  is hashed by the native password mechanism and never returned.
+- Managed enable/disable/delete checks the current database role and binding,
+  compare-and-sets a monotonic revision and preserves all quota/counters. Soft
+  deletion retains the binding tombstone. Durable pending authentication state
+  repairs failed post-commit cache/session synchronization; stale commands
+  cannot override newer state. Machine audit entries use `hmac`, exclude raw
+  credentials/request bodies and remain root-only (unknown interactive role).
 - `batch-get` reads relay quota through its cache-first model function.
   `batch-grant` compare-and-sets absolute totals with additive wallet updates,
   preserving concurrent relay deductions. The grant table stores a pending
@@ -33,17 +43,23 @@ leaves routes, schema and quota-cache behavior unchanged.
   This is necessary even when cache rebuilding overlaps a negative grant.
 
 New runtime code lives in `controller/tokenapi_internal.go`,
-`middleware/tokenapi_internal.go`, and `model/tokenapi_*.go`. Upstream hooks are
+`controller/tokenapi_users.go`, `middleware/tokenapi_internal.go`, and
+`model/tokenapi_*.go`. Upstream hooks are
 the route call in `router/main.go` and the minimal quota snapshot/version checks
 in `model/user_auth_cache.go`. No provider, pricing, settlement, branding or
 license logic is replaced. The extra cache hook is required because internal
 routes alone cannot control cold cache fills from concurrent public requests.
+The session bulk-revoke helper additionally accepts an optional authentication
+version bound. Existing callers are unchanged; delayed managed-user cleanup must
+not revoke sessions created after a newer enable operation. Native PAT proofs,
+authentication version fences and session cache tombstones remain in use.
 
 Regression coverage is consolidated in `router/tokenapi_router_test.go`.
 `.github/workflows/tokenapi-contract.yml` runs it against real SQLite,
 MySQL 8.4, PostgreSQL 16 and Redis, including startup/migration repetition,
 existing rc.49 data/index preservation, G23/G24, replay/concurrency, key ownership
-and lifecycle, and cache-failure/cold-fill recovery. Production internal traffic
+and lifecycle, managed ownership/role rejection, delayed session cleanup,
+creation/lifecycle contention and cache-failure/cold-fill recovery. Production internal traffic
 must use TLS/mTLS or an equivalent encrypted transport and must not be public.
 
 ### CP-06: complete billing and procurement log components
