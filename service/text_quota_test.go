@@ -29,6 +29,64 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestTokenAPIBillingLogDoesNotInventTaskTokenInputs(t *testing.T) {
+	t.Setenv("TOKENAPI_BILLING_LOG_ENABLED", "true")
+	const expression = `tier("video", u("seconds") * 0.4)`
+	result, err := billingexpr.ComputeTieredQuotaWithRequest(&billingexpr.BillingSnapshot{
+		ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+		GroupRatio: 1, QuotaPerUnit: 500000, TaskUsageBilling: true,
+	}, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: map[string]any{"seconds": 10.0}})
+	require.NoError(t, err)
+	assert.Equal(t, 2000000, result.ActualQuotaAfterGroup)
+	assert.Nil(t, result.BillingTokens, "task facts must not become a fabricated zero-token cost vector")
+}
+
+func TestTokenAPICostTokensKeepProcurementComponentsIndependentOfRetailExpression(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		usage  dto.Usage
+		claude bool
+		want   map[string]float64
+	}{
+		{name: "Claude cache TTLs are not folded into retail input", claude: true, usage: dto.Usage{PromptTokens: 100, CompletionTokens: 10, UsageSemantic: "anthropic", PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 200, CachedCreationTokens: 80}, ClaudeCacheCreation5mTokens: 30, ClaudeCacheCreation1hTokens: 50}, want: map[string]float64{"p": 100, "c": 10, "len": 380, "cr": 200, "cc": 30, "cc1h": 50, "cc12h": 0}},
+		{name: "OpenAI twelve hour writes keep their raw category", usage: dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 100, CacheWriteTokens: 200, CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL30mTokens: 150, TTL12hTokens: 50}}}, want: map[string]float64{"p": 700, "c": 100, "len": 1000, "cr": 100, "cc": 150, "cc12h": 50}},
+		{name: "image cache split does not depend on retail AST", usage: dto.Usage{PromptTokens: 1000, CompletionTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 300, ImageTokens: 600, CachedTokensDetails: &dto.CachedTokenDetails{ImageTokens: common.GetPointer(200)}}}, want: map[string]float64{"p": 300, "c": 100, "len": 1000, "cr": 100, "img": 400, "img_cr": 200}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const expression = `tier("base", p * 2 + c * 10)`
+			info := makeRelayInfo(expression, 1, 100, 0)
+			t.Setenv("TOKENAPI_BILLING_LOG_ENABLED", "false")
+			params := BuildTieredTokenParams(&tc.usage, tc.claude, map[string]bool{})
+			ok, before, result := TryTieredSettle(info, params)
+			require.True(t, ok)
+			off := model.NewLogOther()
+			InjectTieredBillingInfo(off, info, result)
+			var offFields map[string]any
+			raw, err := common.Marshal(off)
+			require.NoError(t, err)
+			require.NoError(t, common.Unmarshal(raw, &offFields))
+			assert.NotContains(t, offFields, "cost_tokens")
+			t.Setenv("TOKENAPI_BILLING_LOG_ENABLED", "true")
+			params = BuildTieredTokenParams(&tc.usage, tc.claude, map[string]bool{})
+			ok, after, result := TryTieredSettle(info, params)
+			require.True(t, ok)
+			assert.Equal(t, before, after, "logging must not change retail charges")
+			on := model.NewLogOther()
+			InjectTieredBillingInfo(on, info, result)
+			raw, err = common.Marshal(on)
+			require.NoError(t, err)
+			var fields map[string]any
+			require.NoError(t, common.Unmarshal(raw, &fields))
+			cost, exists := fields["cost_tokens"].(map[string]any)
+			require.True(t, exists)
+			assert.Len(t, cost, 12)
+			for key, value := range tc.want {
+				assert.Equal(t, value, cost[key], key)
+			}
+		})
+	}
+}
+
 // The configured DSNs must point at isolated test databases. Each dialect runs
 // the real reservation, settlement and log paths with the same billing cases.
 func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
@@ -115,6 +173,9 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		want                                      int
 		unit                                      billingexpr.BillingUnit
 		requestedImages, actualImages             int
+		tokenapiLog                               bool
+		billingTokens                             map[string]float64
+		costTokens                                map[string]float64
 	}{
 		{name: "missing usage charges once", expression: flat, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "zero usage charges once", expression: flat, usage: &dto.Usage{}, want: 5000, unit: billingexpr.BillingUnitRequest},
@@ -142,8 +203,20 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		{name: "image override cannot exceed remaining wallet", expression: `tier("image", fixed(0.04)) * image_count`, requestedImages: 1, outboundImages: 4, wallet: 40000, reserveInsufficient: true, refund: true},
 		{name: "task retry holds a pricier channel and refunds all of it", expression: flat, retryReservation: 40000, refund: true},
 		{name: "task retry cannot exceed remaining wallet", expression: flat, retryReservation: 40000, wallet: 20000, reserveInsufficient: true, refund: true},
+		{name: "TokenAPI ordinary cached input log", tokenapiLog: true, expression: `tier("base", p * 8 + c * 28 + cr * 2)`, usage: &dto.Usage{PromptTokens: 80000, CompletionTokens: 600, TotalTokens: 80600, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 72000}}, want: 112400, unit: billingexpr.BillingUnitToken, billingTokens: map[string]float64{"p": 8000, "c": 600, "len": 80000, "cr": 72000, "cc": 0, "cc1h": 0, "cc12h": 0, "img": 0, "img_cr": 0, "img_o": 0, "ai": 0, "ao": 0}},
+		{name: "TokenAPI stream keeps unpriced cache in input", tokenapiLog: true, stream: true, expression: `tier("base", p * 8 + c * 28)`, usage: &dto.Usage{PromptTokens: 80000, CompletionTokens: 600, TotalTokens: 80600, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 72000}}, want: 328400, unit: billingexpr.BillingUnitToken, billingTokens: map[string]float64{"p": 80000, "c": 600, "len": 80000, "cr": 72000}},
+		{name: "TokenAPI audio actual inputs", tokenapiLog: true, audio: true, expression: `tier("base", p * 2 + c * 10 + ai * 4 + ao * 20)`, usage: &dto.Usage{PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 300}, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 20}}, want: 1900, unit: billingexpr.BillingUnitToken, billingTokens: map[string]float64{"p": 700, "c": 80, "ai": 300, "ao": 20, "len": 1000}},
+		{name: "TokenAPI realtime actual inputs", tokenapiLog: true, realtime: true, expression: `tier("base", p * 8 + c * 28)`, usage: &dto.Usage{PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 300}, CompletionTokenDetails: dto.OutputTokenDetails{AudioTokens: 20}}, want: 5400, unit: billingexpr.BillingUnitToken, billingTokens: map[string]float64{"p": 1000, "c": 100, "len": 1000}, costTokens: map[string]float64{"p": 700, "c": 80, "ai": 300, "ao": 20}},
+		{name: "TokenAPI image inputs without image cache expression", tokenapiLog: true, expression: `tier("base", p * 5 + cr * 1.25 + img * 8 + c * 30)`, usage: imageUsage, want: 4338, unit: billingexpr.BillingUnitToken, billingTokens: map[string]float64{"p": 100, "c": 100, "len": 1000, "cr": 300, "img": 600, "img_cr": 0}},
+		{name: "TokenAPI evaluation error does not invent actual inputs", tokenapiLog: true, expression: `p == 50 ? tier("error", param("missing") * p) : tier("base", p * 2)`, estimate: 100, usage: &dto.Usage{PromptTokens: 50, TotalTokens: 50}, want: 100, unit: billingexpr.BillingUnitToken},
+		{name: "TokenAPI fixed branch keeps request metadata", tokenapiLog: true, expression: flat, usage: &dto.Usage{PromptTokens: 100, TotalTokens: 100}, want: 5000, unit: billingexpr.BillingUnitRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.tokenapiLog {
+				t.Setenv("TOKENAPI_BILLING_LOG_ENABLED", "true")
+			} else {
+				t.Setenv("TOKENAPI_BILLING_LOG_ENABLED", "false")
+			}
 			quota := startingQuota
 			if tc.insufficient {
 				quota = 1
@@ -243,6 +316,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 					if tc.realtime {
 						PostWssConsumeQuota(ctx, info, info.OriginModelName, &dto.RealtimeUsage{
 							InputTokens: tc.usage.PromptTokens, OutputTokens: tc.usage.CompletionTokens, TotalTokens: tc.usage.TotalTokens,
+							InputTokenDetails: tc.usage.PromptTokensDetails, OutputTokenDetails: tc.usage.CompletionTokenDetails,
 						}, nil)
 					} else if tc.audio {
 						PostAudioConsumeQuota(ctx, info, tc.usage, nil)
@@ -258,6 +332,16 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 					var other map[string]any
 					require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
 					assert.Equal(t, string(tc.unit), other["billing_unit"])
+					if tc.tokenapiLog && (tc.billingTokens != nil || tc.unit == billingexpr.BillingUnitRequest) {
+						cost, exists := other["cost_tokens"].(map[string]any)
+						require.True(t, exists)
+						assert.Len(t, cost, 12)
+						for key, value := range tc.costTokens {
+							assert.Equal(t, value, cost[key], key)
+						}
+					} else {
+						assert.NotContains(t, other, "cost_tokens")
+					}
 					if tc.requestedImages > 0 {
 						count := tc.actualImages
 						if count == 0 {
@@ -285,6 +369,13 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 							assert.Equal(t, float64(300), billable["p"])
 							assert.Equal(t, float64(100), billable["cr"])
 							assert.Equal(t, float64(400), billable["img"])
+						}
+					} else if tc.billingTokens != nil {
+						billable, ok := other["billing_tokens"].(map[string]any)
+						require.True(t, ok)
+						assert.Len(t, billable, 12)
+						for key, value := range tc.billingTokens {
+							assert.Equal(t, value, billable[key], key)
 						}
 					} else {
 						assert.NotContains(t, other, "billing_tokens")
