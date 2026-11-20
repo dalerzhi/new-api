@@ -32,6 +32,9 @@ type TokenParams struct {
 	ImgO  float64 // image output tokens
 	AI    float64 // audio input tokens
 	AO    float64 // audio output tokens
+
+	// CostTokens is an optional CP-06 component snapshot, never an expression input.
+	CostTokens *TokenParams `json:"-"`
 }
 
 // RequestRuleTrace describes one request-dependent multiplier detected at compile time.
@@ -86,8 +89,9 @@ type BillingSnapshot struct {
 // TieredResult holds everything needed after running tiered settlement.
 type TieredResult struct {
 	// BillingTokens records the actual normalized inputs for successful token
-	// billing that explicitly references img_cr. Logs serialize these through
-	// the shared injection path, not as additional snapshot state.
+	// billing that explicitly references img_cr or enables the CP-06 log patch.
+	// CP-06 also carries cost components for request-priced leaves. Logs use the
+	// shared injection path, not additional snapshot state.
 	BillingTokens          *TokenParams       `json:"-"`
 	ImageCount             *int               `json:"image_count,omitempty"`
 	BillingUnit            BillingUnit        `json:"billing_unit"`

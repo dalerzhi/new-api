@@ -16,7 +16,7 @@ import (
 // TieredResultWrapper wraps billingexpr.TieredResult for use at the service layer.
 type TieredResultWrapper = billingexpr.TieredResult
 
-// BuildTieredTokenParams constructs billingexpr.TokenParams from a dto.Usage,
+// buildTieredTokenParams constructs billingexpr.TokenParams from a dto.Usage,
 // normalizing P and C so they mean "tokens not separately priced by the
 // expression". Sub-categories (cache, image, audio) are only subtracted
 // when the expression references them via their own variable.
@@ -29,7 +29,7 @@ type TieredResultWrapper = billingexpr.TieredResult
 // A long-lived cache write (Claude 1h, OpenAI 12h) without its own price
 // costs a fixed multiple of the short write price: it is billed in cc, or in
 // p when cc has no price either.
-func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVars map[string]bool) billingexpr.TokenParams {
+func buildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVars map[string]bool) billingexpr.TokenParams {
 	p := float64(usage.PromptTokens)
 	c := float64(usage.CompletionTokens)
 	cr := float64(usage.PromptTokensDetails.CachedTokens)

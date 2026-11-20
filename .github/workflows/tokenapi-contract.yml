@@ -1,4 +1,4 @@
-name: TokenAPI CP-02 database contracts
+name: TokenAPI CP-02 and CP-06 database contracts
 
 on:
   pull_request:
@@ -57,6 +57,10 @@ jobs:
       GOWORK: 'off'
       TOKENAPI_TEST_SQL_DSN: ${{ matrix.dsn }}
       TOKENAPI_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      TEST_FIXED_MYSQL_DSN: ${{ matrix.engine == 'mysql' && matrix.dsn || '' }}
+      TEST_FIXED_MYSQL_LOG_DSN: ${{ matrix.engine == 'mysql' && 'root:disposable-test-password@tcp(127.0.0.1:3306)/gateway_log_test?charset=utf8mb4&parseTime=true' || '' }}
+      TEST_FIXED_POSTGRES_DSN: ${{ matrix.engine == 'postgres' && matrix.dsn || '' }}
+      TEST_FIXED_POSTGRES_LOG_DSN: ${{ matrix.engine == 'postgres' && 'postgres://postgres:disposable-test-password@127.0.0.1:5432/gateway_log_test?sslmode=disable' || '' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
@@ -64,3 +68,11 @@ jobs:
           go-version-file: go.mod
       - name: Verify real database, cache, auth and quota contracts
         run: go test -race ./router -run '^TestTokenAPI' -count=1 -v
+      - name: Create separate MySQL billing log test database
+        if: matrix.engine == 'mysql'
+        run: docker exec ${{ job.services.mysql.id }} mysql -uroot -pdisposable-test-password -e 'CREATE DATABASE gateway_log_test'
+      - name: Create separate PostgreSQL billing log test database
+        if: matrix.engine == 'postgres'
+        run: docker exec ${{ job.services.postgres.id }} psql -U postgres -d gateway_test -c 'CREATE DATABASE gateway_log_test'
+      - name: Verify unchanged charges and complete billing logs on real databases
+        run: go test -race ./service -run '^(TestFixedPriceBillingDatabaseMatrix|TestTokenAPI.*)$' -count=1 -v
